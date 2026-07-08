@@ -827,8 +827,11 @@ int nl80211_send_mld_apply(wifi_interface_info_t *interface)
 
 /*
  * Send SET_MLD subcommand with RDK_VENDOR_ATTR_MLD_ENABLE = false
+ *
+ * @param apply - when TRUE the driver commits the MLD immediately; when FALSE the disable is only
+ *                staged and is committed by a subsequent apply=TRUE message.
  */
-int nl80211_send_mld_vap_disable(wifi_interface_info_t *interface)
+int nl80211_send_mld_vap_disable(wifi_interface_info_t *interface, unsigned char apply)
 {
     int ret = 0;
     struct nl_msg *msg_mlo;
@@ -839,8 +842,8 @@ int nl80211_send_mld_vap_disable(wifi_interface_info_t *interface)
         wifi_hal_info_print("### %s: NULL interface ###\n", __func__);
         return -1;
     }
-    wifi_hal_info_print("### %s: mlo_init_map=%d mlo_radio_map=%d on %s ###\n",
-        __func__, mlo_init_map, mlo_radio_map, interface->name);
+    wifi_hal_info_print("### %s: mlo_init_map=%d mlo_radio_map=%d apply=%u on %s ###\n",
+        __func__, mlo_init_map, mlo_radio_map, apply, interface->name);
 
     /*
      * message format
@@ -852,7 +855,7 @@ int nl80211_send_mld_vap_disable(wifi_interface_info_t *interface)
              RDK_VENDOR_NL80211_SUBCMD_SET_MLD)) == NULL ||
         (nlattr_vendor = nla_nest_start(msg_mlo, NL80211_ATTR_VENDOR_DATA)) == NULL ||
         nla_put_u8(msg_mlo, RDK_VENDOR_ATTR_MLD_ENABLE, mld_enable) < 0 ||
-        nla_put_u8(msg_mlo, RDK_VENDOR_ATTR_MLD_CONFIG_APPLY, 1) < 0) {
+        nla_put_u8(msg_mlo, RDK_VENDOR_ATTR_MLD_CONFIG_APPLY, apply) < 0) {
         wifi_hal_error_print("### %s: Failed to create NL command ###\n", __func__);
         nlmsg_free(msg_mlo);
         return -1;
@@ -4856,6 +4859,13 @@ int nl80211_drv_mlo_msg(struct nl_msg *msg, struct nl_msg **msg_mlo, void *priv,
     if (params->mld_ap && params->mld_link_id == 0 && !is_zero_ether_addr(hapd->mld->mld_addr))
         set_mld_mac = TRUE;
 
+    /* Driver limitation: defer commit while MLD has less than two links (apply=FALSE) */
+    if (params->mld_ap && apply && hapd->mld->num_links < 2) {
+        apply = FALSE;
+        wifi_hal_dbg_print("%s:%d iface:%s staging link_id:%u num_links:%u - deferring apply\n",
+            __func__, __LINE__, conf->iface, params->mld_link_id, hapd->mld->num_links);
+    }
+
     wifi_hal_dbg_print(
         "%s:%d iface:%s - mld_ap:%d mld_enab:%d mld_unit:%u mld_link_id:%u mld_addr:%s apply:%d set_mld_mac:%d\n",
         __func__, __LINE__, conf->iface, params->mld_ap, mld_enable, get_mld_unit(conf), params->mld_link_id,
@@ -5134,6 +5144,8 @@ static void mlo_add_link(struct hostapd_data *hapd)
 
 static void mlo_remove_link(struct hostapd_data *hapd)
 {
+    struct hostapd_mld *mld = hapd->mld;
+
     wifi_hal_info_print("%s:%d - iface:%s removing VAP from MLD group - mld links num: %d\n",
         __func__, __LINE__, hapd->conf->iface, hapd->mld->num_links);
     if (hapd->mld && hapd->mld->num_links > 1) {
@@ -5148,6 +5160,23 @@ static void mlo_remove_link(struct hostapd_data *hapd)
     deinit_bss(hapd);
 
     hostapd_bss_link_deinit(hapd);
+
+   /* A Broadcom AP-MLD requires at least two links; the driver rejects (-2) an apply that would
+     * leave the MLD with a single link. If this removal collapses the group to one link, dissolve
+     * it instead: stage an MLD-disable (apply=0) on the surviving link so the committing message of
+     * the link being removed (sent later from start_bss with apply=1) tears the whole MLD down in
+     * one shot, leaving the surviving link as a standalone non-MLO BSS. */
+    if (mld != NULL && mld->num_links == 1 && mld->fbss != NULL) {
+        wifi_interface_info_t *surviving_interface =
+            (wifi_interface_info_t *)((char *)mld->fbss -
+                offsetof(wifi_interface_info_t, u.ap.hapd));
+
+        wifi_hal_info_print("%s:%d - MLD %s would collapse to 1 link; staging disable on surviving "
+            "link iface:%s to dissolve the group\n", __func__, __LINE__, mld->name,
+            mld->fbss->conf->iface);
+
+        nl80211_send_mld_vap_disable(surviving_interface, FALSE);
+    }
 }
 
 int update_hostap_mlo(wifi_interface_info_t *interface)
@@ -5225,7 +5254,7 @@ int update_hostap_mlo(wifi_interface_info_t *interface)
                 /* In case VAP was part of MLO we need to update driver about disabled MLO VAP here,
                  * because nl80211_drv_mlo_msg(called from start_bss) is not called when VAP is disabled
                  */
-                nl80211_send_mld_vap_disable(interface);
+                nl80211_send_mld_vap_disable(interface, TRUE);
             }
 #endif /* MLO_ENAB */
         }
