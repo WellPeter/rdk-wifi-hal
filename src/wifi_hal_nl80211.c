@@ -2554,6 +2554,60 @@ int process_frame_mgmt(wifi_interface_info_t *interface, struct ieee80211_mgmt *
     return -1;
 }
 
+#ifdef CONFIG_DRIVER_BRCM
+/*
+ * The BRCM driver builds every (Re)Association Request it reports from the firmware
+ * WLC_E_ASSOC event as an Association Request. On the MLO MAP the event data of a
+ * Reassociation Request still contains the Current AP address field, so hostapd parses
+ * that address as elements and rejects the STA with status 1 ("invalid association
+ * request"); seen for iPhone and Intel BE200 STAs returning from 2.4 GHz to MLO.
+ * An Association Request body starts with the SSID element after capability and listen
+ * interval. If it does not, but the bytes after a 6-octet field are this BSS's SSID
+ * element, the body is a Reassociation Request: report it as one.
+ */
+static void wifi_hal_fix_reassoc_req_subtype(wifi_interface_info_t *interface,
+    struct ieee80211_mgmt *mgmt, unsigned int len)
+{
+    const unsigned char *body;
+    const char *ssid;
+    unsigned int body_len, ssid_len, ssid_off;
+    u16 fc;
+
+    if (len < IEEE80211_HDRLEN) {
+        return;
+    }
+
+    fc = le_to_host16(mgmt->frame_control);
+    if (WLAN_FC_GET_TYPE(fc) != WLAN_FC_TYPE_MGMT ||
+        WLAN_FC_GET_STYPE(fc) != WLAN_FC_STYPE_ASSOC_REQ ||
+        interface->vap_info.vap_mode != wifi_vap_mode_ap) {
+        return;
+    }
+
+    ssid = (const char *)interface->vap_info.u.bss_info.ssid;
+    ssid_len = strnlen(ssid, sizeof(interface->vap_info.u.bss_info.ssid));
+    body = (const unsigned char *)mgmt + IEEE80211_HDRLEN;
+    body_len = len - IEEE80211_HDRLEN;
+    /* capability (2), listen interval (2), Current AP address (6), SSID element */
+    ssid_off = 2 + 2 + ETH_ALEN;
+    if (ssid_len == 0 || body_len < ssid_off + 2 + ssid_len) {
+        return;
+    }
+
+    if (body[4] == WLAN_EID_SSID ||
+        body[ssid_off] != WLAN_EID_SSID || body[ssid_off + 1] != ssid_len ||
+        memcmp(&body[ssid_off + 2], ssid, ssid_len) != 0) {
+        return;
+    }
+
+    wifi_hal_info_print("%s:%d: interface:%s assoc frame from:" MACSTR " has a reassoc body "
+                        "(current AP " MACSTR "), reporting it as reassoc request\n",
+        __func__, __LINE__, interface->name, MAC2STR(mgmt->sa), MAC2STR(&body[4]));
+    fc = (fc & ~0x00f0) | (WLAN_FC_STYPE_REASSOC_REQ << 4);
+    mgmt->frame_control = host_to_le16(fc);
+}
+#endif /* CONFIG_DRIVER_BRCM */
+
 int process_mgmt_frame(struct nl_msg *msg, void *arg)
 {
     wifi_interface_info_t *interface;
@@ -2705,6 +2759,10 @@ int process_mgmt_frame(struct nl_msg *msg, void *arg)
         }
     }
 #endif // XB10_PORT
+
+#ifdef CONFIG_DRIVER_BRCM
+    wifi_hal_fix_reassoc_req_subtype(interface, mgmt, len);
+#endif /* CONFIG_DRIVER_BRCM */
 
 #ifdef CMXB7_PORT
     if (tb[NL80211_ATTR_RX_SNR_DB]) {
